@@ -5737,48 +5737,56 @@ class DiPlayActivity : ComponentActivity(), AppAppearanceOwner {
         OwnScreenStart.start(this, Intent(this, CarPlayHostActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_REORDER_TO_FRONT))
     }
     private fun choosePhone() {
-        if (Build.VERSION.SDK_INT >= 31 && checkSelfPermission(Manifest.permission.BLUETOOTH_CONNECT) != PackageManager.PERMISSION_GRANTED) {
-            bluetoothPermission.launch(Manifest.permission.BLUETOOTH_CONNECT); return
-        }
-        val adapter = getSystemService(BluetoothManager::class.java)?.adapter ?: BluetoothAdapter.getDefaultAdapter()
-        if (adapter == null) {
-            // Android here has no Bluetooth for apps at all, so there is no switch to send the driver to.
-            pendingWireless = false
-            appDialogBuilder().setTitle(getString(R.string.wireless_carplay_2))
-                .setMessage(getString(R.string.bluetooth_cannot_open_connections))
-                .setPositiveButton(getString(R.string.got_it), null).show(); return
-        }
-        if (!adapter.isEnabled) {
-            // Back from Bluetooth settings and still off: on some head units the switch will not stay on.
-            val message = getString(R.string.enable_the_car_s_bluetooth_and_pair_your_iphone_first) +
-                if (bluetoothSettingsVisited) "\n\n" + getString(R.string.bluetooth_will_not_stay_on_hint) else ""
-            appDialogBuilder().setTitle(getString(R.string.turn_on_bluetooth))
-                .setMessage(message)
-                .setPositiveButton(getString(R.string.open_bluetooth)) { _, _ ->
-                    bluetoothSettingsVisited = true
-                    openBluetoothSettings()
+        Thread({
+            val devices = DongleBluetoothManager.fetchDongleDevices()
+            runOnUiThread { showPhoneChoices(devices) }
+        }, "krdiplay-choose-phone").start()
+    }
+
+    private fun showPhoneChoices(dongleDevices: List<BluetoothDeviceInfo>) {
+        if (isFinishing || isDestroyed) return
+        if (dongleDevices.isEmpty()) {
+            appDialogBuilder().setTitle("未检测到已配对的 iPhone")
+                .setMessage("随身 WiFi 棒子当前尚未配对 iPhone。\n\n请点击下方按钮开启棒子蓝牙广播，并在 iPhone『设置 → 蓝牙』中搜索 KrDiPlay 配对。")
+                .setPositiveButton("开启 KrPlay 蓝牙配对") { _, _ ->
+                    Thread({
+                        val ok = DongleBluetoothManager.enableDonglePairable()
+                        runOnUiThread {
+                            toast(if (ok) "KrPlay 蓝牙广播已开启，请在 iPhone 上搜索 KrDiPlay 配对" else "无法开启棒子配对广播")
+                        }
+                    }).start()
                 }
-                .setNegativeButton(getString(R.string.later), null).show(); return
+                .setNegativeButton(getString(R.string.got_it), null).show()
+            return
         }
-        val devices = runCatching { adapter.bondedDevices.sortedBy { it.name ?: "" } }.getOrDefault(emptyList())
-        if (devices.isEmpty()) {
-            appDialogBuilder().setTitle(getString(R.string.pair_your_iphone))
-                .setMessage(getString(R.string.on_your_iphone_open_settings_bluetooth_and_pair_with_the_c))
-                .setPositiveButton(getString(R.string.open_bluetooth)) { _, _ -> openBluetoothSettings() }
-                .setNegativeButton(getString(R.string.got_it), null).show(); return
-        }
+
+        val items = dongleDevices.map { dev ->
+            val suffix = if (dev.connected) " · 已连" else ""
+            "${dev.name}$suffix"
+        }.toTypedArray()
+
         appDialogBuilder().setTitle(getString(R.string.choose_your_iphone))
-            .setItems(devices.map { device ->
-                val name = device.name ?: getString(R.string.paired_device)
-                if (devices.count { it.name == device.name } > 1) "$name · ${device.address.takeLast(5)}" else name
-            }.toTypedArray()) { _, index ->
-                val device = devices[index]
-                DiPlayPreferences.savePhone(this, device.address, device.name ?: "iPhone")
+            .setItems(items) { _, index ->
+                val dev = dongleDevices[index]
+                DiPlayPreferences.savePhone(this, dev.address, dev.name)
+                Thread({
+                    DongleBluetoothManager.triggerDongleConnect(dev.address)
+                }).start()
                 val start = pendingWireless; pendingWireless = false
                 render()
                 if (start) connect(true)
-            }.setNeutralButton(getString(R.string.pair_another)) { _, _ -> openBluetoothSettings() }
-            .setNegativeButton(getString(R.string.cancel)) { _, _ -> pendingWireless = false }.show()
+            }
+            .setNeutralButton("配对新设备到 KrPlay") { _, _ ->
+                Thread({
+                    val ok = DongleBluetoothManager.enableDonglePairable()
+                    runOnUiThread {
+                        toast(if (ok) "KrPlay 蓝牙广播已开启，请在 iPhone 上搜索 KrDiPlay 配对" else "无法开启棒子配对广播")
+                    }
+                }).start()
+            }
+            .setNegativeButton(getString(R.string.cancel)) { _, _ -> pendingWireless = false }
+            .show()
+
     }
 
     private fun wirelessHelp() {

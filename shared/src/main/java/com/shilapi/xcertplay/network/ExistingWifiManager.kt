@@ -24,6 +24,7 @@ class ExistingWifiManager(
     private val passphrase: String,
     private val onDiagnostic: (String) -> Unit = {},
     private val onNetworkChanged: () -> Unit = {},
+    private val validateNetworkIdentity: ((Network, InetAddress, String) -> Unit)? = null,
 ) : WirelessHotspotManager {
     private val connectivity = context.applicationContext.getSystemService(ConnectivityManager::class.java)
         ?: throw IllegalStateException("ConnectivityManager is unavailable")
@@ -91,6 +92,9 @@ class ExistingWifiManager(
                 val liveSsid = readableSsid(info)
                 if (liveSsid != null && liveSsid != ssid) {
                     throw IOException("Configured Wi-Fi does not match the connected network; check Wi-Fi settings and saved details")
+                }
+                if (liveSsid == null) {
+                    validateNetworkIdentity?.invoke(network, address, ssid)
                 }
                 val frequency = info?.frequency?.takeIf { it > 0 }
                 val channel = frequency?.let(::wifiFrequencyMhzToChannel) ?: 0

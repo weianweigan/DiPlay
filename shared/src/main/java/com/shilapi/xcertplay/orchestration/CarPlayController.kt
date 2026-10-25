@@ -297,7 +297,7 @@ class CarPlayController(
     }.apply { removeOnCancelPolicy = true }
     @Volatile private var wirelessDiagnostics: WirelessStartupDiagnostics? = null
     @Volatile private var bluetoothSocket: BluetoothSocket? = null
-    @Volatile private var bluetoothStream: BluetoothRfcommDuplexStream? = null
+    @Volatile private var bluetoothStream: com.shilapi.xcertplay.transport.BlockingDuplexByteStream? = null
     @Volatile private var wirelessTunnelChannel: Iap2Session? = null
     @Volatile private var wirelessRuntimeIdentification: Iap2IdentificationConfig? = null
     @Volatile private var wirelessAirPlayEndpoint: Iap2WirelessCarPlayEndpoint? = null
@@ -1378,18 +1378,15 @@ class CarPlayController(
             onStatus(CarPlayStatus.WaitingForPairedIphone)
 
             val adapter = currentBluetoothAdapter()
-                ?: throw BluetoothRadioCheck.failure(BluetoothRadioCheck.NO_ADAPTER)
-            val bluetoothRecoveryComplete = BydBluetoothSuspend.resumeAndWait(appContext, adapter)
-            if (adapter.state == BluetoothAdapter.STATE_TURNING_ON) {
-                awaitBluetoothEnabled(adapter, timeoutMillis = 3_000L)
-            }
-            if (!adapter.isEnabled) throw IOException(BluetoothRadioCheck.RADIO_OFF)
-            if (!bluetoothRecoveryComplete) throw IOException("Bluetooth recovery did not complete before the handshake")
-            val device = selectWirelessBluetoothDevice(adapter)
-            val hostBluetoothMac = accessoryBluetoothMac(adapter)
+            val targetAddress = config.wirelessBluetoothDeviceAddress ?: ""
+            val device = if (adapter != null && adapter.isEnabled) {
+                runCatching { selectWirelessBluetoothDevice(adapter) }.getOrNull()
+            } else null
+            // 车载全透传中继架构：必须始终使用 Armbian 随身 WiFi 的 BlueZ 真实蓝牙物理 MAC
+            val hostBluetoothMac = "02:27:97:B6:01:9D"
             debugLog(
-                "wireless selected Bluetooth target name=${device.name ?: "unknown"} " +
-                    "address=${device.address} localBt=$hostBluetoothMac",
+                "wireless selected Bluetooth target name=${device?.name ?: "iPhone"} " +
+                    "address=${device?.address ?: targetAddress} dongleBtMac=$hostBluetoothMac",
             )
             val wirelessAirPlayConfig = airPlayConfig.copy(
                 deviceId = deviceIdentifier,
@@ -1461,51 +1458,44 @@ class CarPlayController(
             }
 
             onStatus(CarPlayStatus.ConnectingBluetooth)
-            debugLog(
-                "wireless RFCOMM connecting address=${device.address} " +
-                    "uuid=$IAP2_IPHONE_UUID",
-            )
-            val socket = synchronized(wirelessResourceLock) {
+            val selectedMac = targetAddress.ifEmpty { device?.address ?: "" }
+            debugLog("wireless connecting RFCOMM via Armbian relay address=$selectedMac")
+            // Dial outside wirelessResourceLock so teardown never waits for network timeouts.
+            val connectivity = appContext.getSystemService(android.net.ConnectivityManager::class.java)
+            val relayNetwork = connectivity?.allNetworks?.firstOrNull {
+                connectivity.getLinkProperties(it)?.interfaceName == hotspotInfo.interfaceName
+            } ?: throw IOException("CarPlay Wi-Fi network is no longer available")
+            var relaySocket: java.net.Socket? = null
+            for (candidate in com.shilapi.xcertplay.DongleBluetoothManager.getCandidateHosts()) {
                 if (isStaleWirelessRun(generation)) return
-                device.createRfcommSocketToServiceRecord(UUID.fromString(IAP2_IPHONE_UUID))
-                    .also { bluetoothSocket = it }
-            }
-            logBluetoothConnectionSnapshot(device, "before-connect")
-            val bluetoothStarted = System.nanoTime()
-            val bluetoothConnectMillis: Long
-            try {
-                connectBluetoothSocket(socket, device.address)
-                bluetoothConnectMillis = elapsedMillis(bluetoothStarted)
-                connectionDiagnostic("Bluetooth connect completed elapsedMs=$bluetoothConnectMillis " +
-                    "socketReportedConnected=${runCatching { socket.isConnected }.getOrNull() ?: "unknown"}")
-            } catch (error: Throwable) {
-                connectionDiagnostic(
-                    "Bluetooth connect failed elapsedMs=${elapsedMillis(bluetoothStarted)} " +
-                        "failureClass=${diagnosticFailureClass(error)}",
-                )
-                logBluetoothConnectionSnapshot(device, "after-failure")
-                throw error
-            }
-            debugLog("wireless RFCOMM connected address=${device.address}")
-            logBluetoothConnectionSnapshot(device, "after-connect")
-            if (isStaleWirelessRun(generation)) {
-                return
-            }
-            val stream = synchronized(wirelessResourceLock) {
-                if (isStaleWirelessRun(generation)) return
+                val socket = java.net.Socket()
                 try {
-                    BluetoothRfcommDuplexStream(socket, ::connectionDiagnostic).also { bluetoothStream = it }
-                } finally {
-                    // The stream owns the connected socket and also closes it if stream getters
-                    // fail. Do not retain a second socket owner in bootstrap teardown.
-                    if (bluetoothSocket === socket) bluetoothSocket = null
+                    socket.tcpNoDelay = true
+                    socket.keepAlive = true
+                    relayNetwork.bindSocket(socket)
+                    socket.connect(java.net.InetSocketAddress(candidate, 8901), 1000)
+                    relaySocket = socket
+                    com.shilapi.xcertplay.DongleBluetoothManager.activeDongleHost = candidate
+                    debugLog("Connected to Armbian RFCOMM relay at $candidate:8901")
+                    break
+                } catch (error: Exception) {
+                    runCatching { socket.close() }
+                    debugLog("Armbian relay $candidate:8901 unavailable: ${error.message}")
                 }
             }
-            if (BluetoothLinkCheck.looksUnreal(bluetoothConnectMillis, 0L)) {
-                InstantBluetoothLink(generation, device, stream, bluetoothConnectMillis).also {
-                    instantBluetoothLink = it
-                    watchForUnrealBluetooth(it)
+            val stream = com.shilapi.xcertplay.transport.SocketDuplexStream(
+                relaySocket ?: throw IOException("Armbian Bluetooth relay is unavailable (8901)"),
+            )
+            synchronized(wirelessResourceLock) {
+                if (isStaleWirelessRun(generation)) {
+                    stream.close()
+                    return
                 }
+                bluetoothStream = stream
+            }
+            // Register TCP before asking BlueZ to connect. HTTP acceptance is not iAP2 readiness.
+            if (selectedMac.isEmpty() || !com.shilapi.xcertplay.DongleBluetoothManager.triggerDongleConnect(selectedMac)) {
+                throw IOException("Armbian did not accept the Bluetooth connection request")
             }
             val channel = Iap2Session.openWireless(
                 stream,
@@ -2472,6 +2462,7 @@ class CarPlayController(
             WirelessHotspotMode.EXISTING_WIFI -> ExistingWifiManager(
                 appContext, config.existingWifiSsid, config.existingWifiPassphrase, ::debugLog,
                 onNetworkChanged = { if (!isStaleWirelessRun(generation)) restartWireless() },
+                validateNetworkIdentity = com.shilapi.xcertplay.DongleBluetoothManager::validateWifiNetwork,
             )
             WirelessHotspotMode.MANUAL -> ManualHotspotManager(
                 context = appContext,
@@ -2540,6 +2531,7 @@ class CarPlayController(
         val bonded = adapter.bondedDevices.orEmpty()
         config.wirelessBluetoothDeviceAddress?.let { selected ->
             return bonded.firstOrNull { it.address.equals(selected, ignoreCase = true) }
+                ?: runCatching { adapter.getRemoteDevice(selected) }.getOrNull()
                 ?: throw IOException("The selected iPhone is no longer paired. Choose it again in DiPlay.")
         }
         val iPhones = bonded.filter { device ->

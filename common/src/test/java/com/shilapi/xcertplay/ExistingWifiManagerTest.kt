@@ -221,6 +221,28 @@ class ExistingWifiManagerTest {
         assertThrows(IllegalArgumentException::class.java) { manager("short") }
     }
 
+    @Test fun redactedSsidRequiresInjectedRelayIdentityCheckBeforePublishing() {
+        `when`(info.ssid).thenReturn(WifiManager.UNKNOWN_SSID)
+        var verified = false
+        ExistingWifiManager(context, "Pocket Wi-Fi", "pocket-password",
+            validateNetworkIdentity = { selected, address, ssid ->
+                assertSame(network, selected)
+                assertEquals("192.0.2.10", address.hostAddress)
+                assertEquals("Pocket Wi-Fi", ssid)
+                verified = true
+            }).use { start(it) }
+        assertTrue(verified)
+    }
+
+    @Test fun rejectedRelayIdentityNeverPublishesWifiOrRegistersCallback() {
+        `when`(info.ssid).thenReturn(WifiManager.UNKNOWN_SSID)
+        ExistingWifiManager(context, "Pocket Wi-Fi", "pocket-password",
+            validateNetworkIdentity = { _, _, _ -> throw IOException("wrong CarPlay network") }).use {
+            assertEquals("wrong CarPlay network", assertThrows(IOException::class.java) { start(it) }.message)
+        }
+        verify(connectivity, never()).registerNetworkCallback(any(NetworkRequest::class.java), any(ConnectivityManager.NetworkCallback::class.java))
+    }
+
     private fun manager(password: String = "pocket-password") = ExistingWifiManager(context,
         "Pocket Wi-Fi", password, diagnostics::add, { changes++ })
 

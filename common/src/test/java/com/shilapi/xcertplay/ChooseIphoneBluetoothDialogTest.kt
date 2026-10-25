@@ -1,29 +1,24 @@
 package com.shilapi.xcertplay
 
 import android.app.AlertDialog
-import android.bluetooth.BluetoothAdapter
 import android.content.Context
-import android.os.Looper
 import android.view.View
 import android.view.ViewGroup
 import android.widget.TextView
-import com.shilapi.xcertplay.host.R
 import org.junit.After
-import org.junit.Assert.assertEquals
-import org.junit.Assert.assertFalse
-import org.junit.Assert.assertTrue
+import org.junit.Assert.*
 import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.Robolectric
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.RuntimeEnvironment
-import org.robolectric.Shadows.shadowOf
 import org.robolectric.annotation.Config
 import org.robolectric.shadows.ShadowAlertDialog
 import org.robolectric.shadows.ShadowBluetoothAdapter
 import org.robolectric.util.ReflectionHelpers
+import org.robolectric.util.ReflectionHelpers.ClassParameter
 
-/** What "Choose iPhone" says when Android's Bluetooth is missing, off, or will not stay on. */
+/** The fork chooses phones from Armbian, even when Android has no Bluetooth adapter. */
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [29], qualifiers = "en-w1000dp-h700dp-land")
 class ChooseIphoneBluetoothDialogTest {
@@ -38,12 +33,9 @@ class ChooseIphoneBluetoothDialogTest {
         context.getSharedPreferences("xcertplay_airplay", 0).edit().clear().commit()
     }
 
-    private fun open(): DiPlayActivity =
-        Robolectric.buildActivity(DiPlayActivity::class.java).setup().get().also { activity = it }
-
-    private fun choosePhone(screen: DiPlayActivity): AlertDialog {
-        ReflectionHelpers.callInstanceMethod<Unit>(screen, "choosePhone")
-        shadowOf(Looper.getMainLooper()).idle()
+    private fun show(devices: List<BluetoothDeviceInfo>): AlertDialog {
+        val screen = Robolectric.buildActivity(DiPlayActivity::class.java).setup().get().also { activity = it }
+        ReflectionHelpers.callInstanceMethod<Unit>(screen, "showPhoneChoices", ClassParameter.from(List::class.java, devices))
         return ShadowAlertDialog.getLatestAlertDialog()
     }
 
@@ -55,60 +47,27 @@ class ChooseIphoneBluetoothDialogTest {
         if (view is ViewGroup) for (index in 0 until view.childCount) yieldAll(descendants(view.getChildAt(index)))
     }
 
-    // Issue 703's screen: the car's own Bluetooth is on, Android has none, and DiPlay asked to turn it on.
-    @Test fun aHeadUnitWithoutAndroidBluetoothIsToldSoInsteadOfBeingSentToASwitch() {
+    @Test fun missingAndroidBluetoothOffersArmbianPairing() {
         ShadowBluetoothAdapter.setIsBluetoothSupported(false)
-        val screen = open()
-        val dialog = choosePhone(screen)
+        val dialog = show(emptyList())
         val shown = texts(dialog)
-        assertTrue(shown.toString(), screen.getString(R.string.bluetooth_cannot_open_connections) in shown)
-        assertFalse(shown.toString(), screen.getString(R.string.turn_on_bluetooth) in shown)
-        assertFalse(shown.toString(), screen.getString(R.string.enable_the_car_s_bluetooth_and_pair_your_iphone_first) in shown)
-        assertEquals(screen.getString(R.string.got_it), dialog.getButton(AlertDialog.BUTTON_POSITIVE).text.toString())
-        assertEquals(View.GONE, dialog.getButton(AlertDialog.BUTTON_NEGATIVE).visibility)
+        assertTrue(shown.toString(), shown.any { "KrDiPlay" in it })
+        assertEquals("开启 KrPlay 蓝牙配对", dialog.getButton(AlertDialog.BUTTON_POSITIVE).text.toString())
     }
 
-    @Test fun bluetoothThatIsOffIsAskedForAsBefore() {
-        shadowOf(BluetoothAdapter.getDefaultAdapter()).setEnabled(false)
-        val screen = open()
-        val dialog = choosePhone(screen)
-        val shown = texts(dialog)
-        assertTrue(shown.toString(), screen.getString(R.string.turn_on_bluetooth) in shown)
-        assertTrue(shown.toString(), screen.getString(R.string.enable_the_car_s_bluetooth_and_pair_your_iphone_first) in shown)
-        assertEquals(screen.getString(R.string.open_bluetooth), dialog.getButton(AlertDialog.BUTTON_POSITIVE).text.toString())
+    @Test fun pairedRelayPhoneIsSelectableWithoutAndroidBluetooth() {
+        ShadowBluetoothAdapter.setIsBluetoothSupported(false)
+        val dialog = show(listOf(BluetoothDeviceInfo("00:11:22:33:44:55", "Relay iPhone", true)))
+        assertEquals("Relay iPhone", dialog.listView.adapter.getItem(0))
+        assertEquals("配对新设备到 KrPlay", dialog.getButton(AlertDialog.BUTTON_NEUTRAL).text.toString())
     }
 
-    // Issue 581's head unit: the switch in Android's settings turns itself off again.
-    @Test fun bluetoothStillOffAfterAVisitToItsSettingsGetsTheHint() {
-        shadowOf(BluetoothAdapter.getDefaultAdapter()).setEnabled(false)
-        val screen = open()
-        val hint = screen.getString(R.string.bluetooth_will_not_stay_on_hint)
-        val first = choosePhone(screen)
-        assertFalse(texts(first).toString(), texts(first).any { hint in it })
-        first.getButton(AlertDialog.BUTTON_POSITIVE).performClick()
-        shadowOf(Looper.getMainLooper()).idle()
-
-        val second = choosePhone(screen)
-        val message = texts(second).single { screen.getString(R.string.enable_the_car_s_bluetooth_and_pair_your_iphone_first) in it }
-        assertTrue(message, message.endsWith(hint))
-        assertEquals(screen.getString(R.string.open_bluetooth), second.getButton(AlertDialog.BUTTON_POSITIVE).text.toString())
-    }
-
-    // Declining the dialog is not a visit to the settings: nothing suggests the switch failed.
-    @Test fun choosingLaterDoesNotBringTheHint() {
-        shadowOf(BluetoothAdapter.getDefaultAdapter()).setEnabled(false)
-        val screen = open()
-        choosePhone(screen).getButton(AlertDialog.BUTTON_NEGATIVE).performClick()
-        shadowOf(Looper.getMainLooper()).idle()
-        val again = texts(choosePhone(screen))
-        assertFalse(again.toString(), again.any { screen.getString(R.string.bluetooth_will_not_stay_on_hint) in it })
-    }
-
-    @Test fun bluetoothThatIsOnGoesOnToPairing() {
-        shadowOf(BluetoothAdapter.getDefaultAdapter()).setEnabled(true)
-        val screen = open()
-        val shown = texts(choosePhone(screen))
-        assertTrue(shown.toString(), screen.getString(R.string.pair_your_iphone) in shown)
-        assertFalse(shown.toString(), screen.getString(R.string.turn_on_bluetooth) in shown)
+    @Test fun connectedIndicatorComesFromTheRelay() {
+        val dialog = show(listOf(
+            BluetoothDeviceInfo("00:11:22:33:44:55", "First", true, connected = true),
+            BluetoothDeviceInfo("00:11:22:33:44:66", "Second", true, connected = false),
+        ))
+        assertEquals("First · 已连", dialog.listView.adapter.getItem(0))
+        assertEquals("Second", dialog.listView.adapter.getItem(1))
     }
 }
